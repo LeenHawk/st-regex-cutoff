@@ -5,6 +5,17 @@
     margin-top: 8px;
 }
 
+/* div 版 menu_button 防止被压缩到最小宽度导致文字竖排 */
+.regex-cutoff-settings .menu_button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    width: fit-content;
+    white-space: nowrap;
+    flex: 0 0 auto;
+}
+
 .regex-cutoff-settings .rc_group_header {
     margin-bottom: 4px;
 }
