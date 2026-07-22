@@ -1,0 +1,23 @@
+.regex-cutoff-settings .rc_group {
+    border: 1px solid var(--SmartThemeBorderColor, #444);
+    border-radius: 6px;
+    padding: 6px;
+    margin-top: 8px;
+}
+
+.regex-cutoff-settings .rc_group_header {
+    margin-bottom: 4px;
+}
+
+.regex-cutoff-settings .rc_g_patterns {
+    width: 100%;
+    font-family: monospace;
+}
+
+.regex-cutoff-settings .rc_g_err.rc_err_on {
+    color: var(--warning, #e57373);
+}
+
+.regex-cutoff-settings #rc_test_result {
+    margin-top: 6px;
+}
