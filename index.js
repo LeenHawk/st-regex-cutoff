@@ -13,6 +13,12 @@
  *    2) 把消息从“最早命中位置”截断（命中文本及其之后全部删除），
  *       并在此基础上再往前多删 X 个字符（X 可在设置里调整）；
  *    3) 非流式或流式期间漏检时，在消息落库后兜底检测并截断。
+ *
+ *  分段自动续写（可选）：
+ *    流式生成中按 token 计数，每段达到阈值即中止生成，然后注入“续写提示词”
+ *    （只进入本次请求、不写入对话记录）并自动触发 ST 原生“继续”续写；
+ *    每段开始时 token 计数自动清零；整条消息达到最大总 token 后停止续写。
+ *    若正则命中导致截断，续写循环同样终止。
  */
 
 const MODULE_NAME = 'regex_cutoff';
@@ -31,6 +37,17 @@ const DEFAULT_SETTINGS = Object.freeze({
     streamAbort: true,  // 流式命中时立即中止生成
     notify: true,       // 触发时弹出提示
     groups: [],
+
+    // —— 分段自动续写 ——
+    autoContinue: {
+        enabled: false,
+        segmentTokens: 1000,    // 每段生成到多少 token 后截断并续写
+        maxTotalTokens: 4000,   // 整条消息最大总 token，达到后不再续写
+        role: 'system',         // 续写提示词的注入角色：system / user
+        prompt:
+            'Continue the reply seamlessly from exactly where it was cut off. ' +
+            'Do not repeat any existing text, do not summarize, and do not add any preamble.',
+    },
 });
 
 // —— 设置读取/初始化 ——
@@ -49,6 +66,12 @@ function getSettings() {
         for (const k of Object.keys(DEFAULT_GROUP)) {
             if (!Object.hasOwn(g, k)) g[k] = DEFAULT_GROUP[k];
         }
+    }
+    if (typeof s.autoContinue !== 'object' || s.autoContinue === null) {
+        s.autoContinue = structuredClone(DEFAULT_SETTINGS.autoContinue);
+    }
+    for (const k of Object.keys(DEFAULT_SETTINGS.autoContinue)) {
+        if (!Object.hasOwn(s.autoContinue, k)) s.autoContinue[k] = DEFAULT_SETTINGS.autoContinue[k];
     }
     return s;
 }
@@ -138,23 +161,124 @@ function cutText(text, cutStart, deleteChars) {
 }
 
 // ============================================================
-//  流式实时检测：命中即中止生成
+//  token 计数与续写提示词注入
 // ============================================================
-let abortedThisGen = false;
+async function countTokens(text) {
+    const ctx = SillyTavern.getContext();
+    try {
+        if (typeof ctx.getTokenCountAsync === 'function') return await ctx.getTokenCountAsync(text);
+        if (typeof ctx.getTokenCount === 'function') return ctx.getTokenCount(text);
+    } catch (e) {
+        console.warn(LOG, 'token 计数失败，退回估算：', e);
+    }
+    return Math.ceil(String(text ?? '').length / 3);
+}
 
-function onStreamToken(text) {
+// 续写提示词通过 setExtensionPrompt 注入：只进入本次请求的 prompt，不写入对话记录
+function setContinuePrompt(text) {
+    try {
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.setExtensionPrompt !== 'function') {
+            console.warn(LOG, '当前 ST 版本不支持 setExtensionPrompt，续写提示词无法注入');
+            return;
+        }
+        const s = getSettings();
+        const IN_CHAT = ctx.extension_prompt_types?.IN_CHAT ?? 1;
+        const roles = ctx.extension_prompt_roles ?? { SYSTEM: 0, USER: 1 };
+        const role = s.autoContinue.role === 'user' ? roles.USER : roles.SYSTEM;
+        ctx.setExtensionPrompt(MODULE_NAME, String(text ?? ''), IN_CHAT, 0, false, role);
+    } catch (e) {
+        console.warn(LOG, '注入续写提示词失败：', e);
+    }
+}
+
+function clearContinuePrompt() {
+    setContinuePrompt('');
+}
+
+// ============================================================
+//  流式实时检测：正则命中即中止；分段 token 达标即中止并续写
+// ============================================================
+let abortedThisGen = false;         // 本次生成因“正则命中”而中止
+let tokenAbortedThisGen = false;    // 本次生成因“达到每段 token 上限”而中止
+let pendingAutoContinue = false;    // 已请求自动续写，等待下一次生成开始
+let currentIsAutoContinue = false;  // 当前生成是否为本扩展触发的自动续写
+let currentGenType = '';
+let roundsThisMessage = 0;          // 本条消息已自动续写的段数
+let streamBaselineTokens = 0;       // 续写时流式文本包含已有前缀，作为计数基线
+let tokenCheck = { busy: false, last: 0 };
+
+function stopGenerationNow() {
+    const ctx = SillyTavern.getContext();
+    if (typeof ctx.stopGeneration === 'function') {
+        ctx.stopGeneration();
+    } else {
+        $('#mes_stop').trigger('click');
+    }
+}
+
+async function onGenerationStarted(type, _params, dryRun) {
+    if (dryRun) return;
+    currentGenType = String(type ?? '');
+    abortedThisGen = false;
+    tokenAbortedThisGen = false;
+    tokenCheck = { busy: false, last: 0 };
+    currentIsAutoContinue = pendingAutoContinue;
+    pendingAutoContinue = false;
+    if (!currentIsAutoContinue) {
+        // 用户主动发起的生成：重置续写轮次，并确保没有残留注入
+        roundsThisMessage = 0;
+        clearContinuePrompt();
+    }
+    // 续写（continue）时流式文本会带上已有消息内容，先记下基线 token
+    streamBaselineTokens = 0;
+    if (currentGenType === 'continue') {
+        try {
+            const chat = SillyTavern.getContext().chat;
+            const idx = findLastAssistantIndex(chat);
+            if (idx >= 0) streamBaselineTokens = await countTokens(String(chat[idx].mes ?? ''));
+        } catch (e) {
+            console.warn(LOG, '计算续写基线 token 失败：', e);
+        }
+    }
+}
+
+async function onStreamToken(raw) {
     try {
         const s = getSettings();
-        if (!s.enabled || !s.streamAbort || abortedThisGen) return;
-        const hit = detect(String(text ?? ''), s);
-        if (!hit) return;
-        abortedThisGen = true;
-        console.log(LOG, `流式命中分组 [${hit.groupNames.join('、')}]，中止生成`);
-        const ctx = SillyTavern.getContext();
-        if (typeof ctx.stopGeneration === 'function') {
-            ctx.stopGeneration();
-        } else {
-            $('#mes_stop').trigger('click');
+        if (!s.enabled || abortedThisGen || tokenAbortedThisGen) return;
+        const text = String(raw ?? '');
+
+        // —— 正则实时检测 ——
+        if (s.streamAbort) {
+            const hit = detect(text, s);
+            if (hit) {
+                abortedThisGen = true;
+                console.log(LOG, `流式命中分组 [${hit.groupNames.join('、')}]，中止生成`);
+                stopGenerationNow();
+                return;
+            }
+        }
+
+        // —— 分段 token 检测（节流 250ms，需开启流式才生效） ——
+        const ac = s.autoContinue;
+        if (!ac.enabled) return;
+        if (currentGenType === 'quiet' || currentGenType === 'impersonate') return;
+        const now = Date.now();
+        if (tokenCheck.busy || now - tokenCheck.last < 250) return;
+        tokenCheck.busy = true;
+        try {
+            const total = await countTokens(text);
+            tokenCheck.last = Date.now();
+            const segment = total - streamBaselineTokens;
+            if (!tokenAbortedThisGen && !abortedThisGen &&
+                segment >= Math.max(1, Number(ac.segmentTokens) || 0)) {
+                tokenAbortedThisGen = true;
+                console.log(LOG, `本段已生成 ${segment} token，达到上限 ${ac.segmentTokens}，截断本段`);
+                stopGenerationNow();
+            }
+        } finally {
+            tokenCheck.busy = false;
         }
     } catch (e) {
         console.error(LOG, '流式检测出错：', e);
@@ -235,15 +359,84 @@ async function applyCutToLastMessage({ silent = false } = {}) {
     return true;
 }
 
-// 生成结束后延迟一点再兜底截断，确保消息已落库
+// ============================================================
+//  分段自动续写：段截断落库后决定是否续写下一段
+// ============================================================
+async function maybeAutoContinue(regexCutApplied) {
+    const ctx = SillyTavern.getContext();
+    const s = getSettings();
+    const ac = s.autoContinue;
+
+    // 只有“因每段 token 上限而中止”的生成才续写；其余情况清掉注入即可
+    if (!tokenAbortedThisGen) {
+        if (!pendingAutoContinue) clearContinuePrompt();
+        return;
+    }
+    tokenAbortedThisGen = false;
+
+    if (!s.enabled || !ac.enabled) { clearContinuePrompt(); return; }
+    // 正则命中截断过的消息不再续写
+    if (regexCutApplied || abortedThisGen) {
+        clearContinuePrompt();
+        roundsThisMessage = 0;
+        return;
+    }
+
+    const chat = ctx.chat;
+    const idx = findLastAssistantIndex(chat);
+    if (idx < 0) { clearContinuePrompt(); return; }
+
+    const total = await countTokens(String(chat[idx].mes ?? ''));
+    const maxTotal = Math.max(1, Number(ac.maxTotalTokens) || 1);
+    if (total >= maxTotal) {
+        clearContinuePrompt();
+        roundsThisMessage = 0;
+        if (s.notify) toastr.info(`已达最大总 token（${total}/${maxTotal}），停止续写`, '正则截断');
+        return;
+    }
+
+    // 防失控：轮次上限 = ceil(最大总量/每段) + 3
+    const cap = Math.ceil(maxTotal / Math.max(1, Number(ac.segmentTokens) || 1)) + 3;
+    if (roundsThisMessage >= cap) {
+        console.warn(LOG, `续写轮次达到安全上限 ${cap}，停止`);
+        clearContinuePrompt();
+        roundsThisMessage = 0;
+        return;
+    }
+    roundsThisMessage++;
+
+    setContinuePrompt(ac.prompt);
+    pendingAutoContinue = true;
+    if (s.notify) toastr.info(`当前 ${total}/${maxTotal} token，自动续写第 ${roundsThisMessage} 段`, '正则截断');
+    try {
+        if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
+            await ctx.executeSlashCommandsWithOptions('/continue');
+        } else {
+            pendingAutoContinue = false;
+            clearContinuePrompt();
+            console.warn(LOG, '当前 ST 版本不支持 executeSlashCommandsWithOptions，无法自动续写');
+        }
+    } catch (e) {
+        pendingAutoContinue = false;
+        clearContinuePrompt();
+        console.error(LOG, '触发续写失败：', e);
+    }
+}
+
+// 生成结束后延迟一点再兜底截断，确保消息已落库；随后决定是否自动续写
 let finalizeTimer = null;
 function scheduleFinalize() {
     const s = getSettings();
     if (!s.enabled) return;
     if (finalizeTimer) clearTimeout(finalizeTimer);
-    finalizeTimer = setTimeout(() => {
+    finalizeTimer = setTimeout(async () => {
         finalizeTimer = null;
-        applyCutToLastMessage({ silent: true }).catch((e) => console.error(LOG, '截断出错：', e));
+        try {
+            const regexCut = await applyCutToLastMessage({ silent: true });
+            await maybeAutoContinue(regexCut);
+        } catch (e) {
+            console.error(LOG, '收尾处理出错：', e);
+        }
     }, 300);
 }
 
@@ -296,6 +489,34 @@ function buildSettingsHtml() {
           <div class="menu_button" id="rc_add_group" style="margin-top:6px;">
             <i class="fa-solid fa-plus"></i> 添加分组
           </div>
+
+          <hr>
+          <h4>分段自动续写</h4>
+
+          <label class="checkbox_label" for="rc_ac_enabled">
+            <input id="rc_ac_enabled" type="checkbox" />
+            <span>启用：每段生成到指定 token 数即截断，并自动续写下一段</span>
+          </label>
+
+          <div class="flex-container" style="align-items:center; gap:6px; margin-top:6px;">
+            <span>每段</span>
+            <input id="rc_ac_segment" type="number" min="50" step="50" class="text_pole" style="max-width:90px;" />
+            <span>token 截断续写；总量达</span>
+            <input id="rc_ac_max" type="number" min="100" step="100" class="text_pole" style="max-width:90px;" />
+            <span>token 后停止</span>
+          </div>
+
+          <label for="rc_ac_prompt" style="margin-top:6px;">续写提示词（只注入本次请求，不进对话记录）</label>
+          <textarea id="rc_ac_prompt" class="text_pole textarea_compact" rows="3"></textarea>
+
+          <div class="flex-container" style="align-items:center; gap:6px;">
+            <span>注入角色</span>
+            <select id="rc_ac_role" class="text_pole" style="max-width:120px;">
+              <option value="system">system</option>
+              <option value="user">user</option>
+            </select>
+          </div>
+          <small class="notes">需要开启流式输出才能按段截断。续写走 ST 原生“继续”机制，每段开始时 token 计数自动清零；手动点停止不会触发续写；若正则命中截断，续写同样终止。</small>
 
           <hr>
           <h4>测试与手动执行</h4>
@@ -358,6 +579,11 @@ function refreshUI() {
     $('#rc_stream_abort').prop('checked', s.streamAbort);
     $('#rc_notify').prop('checked', s.notify);
     $('#rc_delete_chars').val(s.deleteChars);
+    $('#rc_ac_enabled').prop('checked', s.autoContinue.enabled);
+    $('#rc_ac_segment').val(s.autoContinue.segmentTokens);
+    $('#rc_ac_max').val(s.autoContinue.maxTotalTokens);
+    $('#rc_ac_prompt').val(s.autoContinue.prompt);
+    $('#rc_ac_role').val(s.autoContinue.role);
     renderGroups();
 }
 
@@ -369,6 +595,21 @@ function bindUI() {
     $('#rc_notify').on('change', function () { s.notify = $(this).prop('checked'); save(); });
     $('#rc_delete_chars').on('input', function () {
         s.deleteChars = Math.max(0, parseInt($(this).val()) || 0);
+        save();
+    });
+
+    $('#rc_ac_enabled').on('change', function () { s.autoContinue.enabled = $(this).prop('checked'); save(); });
+    $('#rc_ac_segment').on('input', function () {
+        s.autoContinue.segmentTokens = Math.max(1, parseInt($(this).val()) || 1000);
+        save();
+    });
+    $('#rc_ac_max').on('input', function () {
+        s.autoContinue.maxTotalTokens = Math.max(1, parseInt($(this).val()) || 4000);
+        save();
+    });
+    $('#rc_ac_prompt').on('input', function () { s.autoContinue.prompt = String($(this).val()); save(); });
+    $('#rc_ac_role').on('change', function () {
+        s.autoContinue.role = String($(this).val()) === 'user' ? 'user' : 'system';
         save();
     });
 
@@ -459,11 +700,21 @@ jQuery(async () => {
         registerSlashCommand();
 
         const { eventSource, event_types } = ctx;
-        eventSource.on(event_types.GENERATION_STARTED, () => { abortedThisGen = false; });
+        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
         eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
         eventSource.on(event_types.MESSAGE_RECEIVED, scheduleFinalize);
         eventSource.on(event_types.GENERATION_STOPPED, scheduleFinalize);
         eventSource.on(event_types.GENERATION_ENDED, scheduleFinalize);
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            // 切换聊天时终止续写循环并清掉注入
+            pendingAutoContinue = false;
+            tokenAbortedThisGen = false;
+            roundsThisMessage = 0;
+            clearContinuePrompt();
+        });
+
+        // 清理可能残留的注入
+        clearContinuePrompt();
 
         console.log(LOG, '已加载');
     } catch (e) {
