@@ -298,6 +298,48 @@ async function onStreamToken(raw) {
     }
 }
 
+function trimRequestMessageEnd(message) {
+    if (!message) return false;
+    if (typeof message.content === 'string') {
+        const trimmed = message.content.trimEnd();
+        if (trimmed === message.content) return false;
+        message.content = trimmed;
+        return true;
+    }
+    if (!Array.isArray(message.content)) return false;
+
+    for (let i = message.content.length - 1; i >= 0; i--) {
+        const part = message.content[i];
+        if (!part || typeof part.text !== 'string') continue;
+        const trimmed = part.text.trimEnd();
+        if (trimmed === part.text) return false;
+        part.text = trimmed;
+        return true;
+    }
+    return false;
+}
+
+// ST 会在聊天记录读取后添加 continue_postfix；直接修正最终请求才能覆盖该步骤。
+function onGenerateAfterData(generateData, dryRun) {
+    if (dryRun || !currentIsAutoContinue) return;
+
+    const messages = Array.isArray(generateData?.prompt)
+        ? generateData.prompt
+        : (Array.isArray(generateData?.messages) ? generateData.messages : null);
+    if (!messages) return;
+
+    const assistantIdx = messages.findLastIndex((message) => message?.role === 'assistant');
+    if (assistantIdx >= 0 && trimRequestMessageEnd(messages[assistantIdx])) {
+        console.log(LOG, '续写请求发送前已清理 assistant 尾部空白');
+    }
+
+    if (messages.at(-1)?.role === 'assistant') {
+        const prompt = String(getSettings().autoContinue.prompt ?? '').trim() || 'Continue the reply.';
+        messages.push({ role: 'user', content: prompt });
+        console.log(LOG, '续写请求原本以 assistant 结尾，已追加临时 user 提示');
+    }
+}
+
 // ============================================================
 //  落库后截断（流式中止后 / 非流式兜底 / 手动触发）
 // ============================================================
@@ -743,6 +785,7 @@ jQuery(async () => {
         const { eventSource, event_types } = ctx;
         eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
         eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
+        eventSource.on(event_types.GENERATE_AFTER_DATA, onGenerateAfterData);
         eventSource.on(event_types.MESSAGE_RECEIVED, scheduleFinalize);
         eventSource.on(event_types.GENERATION_STOPPED, scheduleFinalize);
         eventSource.on(event_types.GENERATION_ENDED, scheduleFinalize);
