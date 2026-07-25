@@ -309,6 +309,33 @@ function findLastAssistantIndex(chat) {
     return -1;
 }
 
+async function updateAssistantMessageText(ctx, idx, text) {
+    const msg = ctx.chat[idx];
+    msg.mes = text;
+    if (Array.isArray(msg.swipes) && Number.isInteger(msg.swipe_id) &&
+        msg.swipe_id >= 0 && msg.swipe_id < msg.swipes.length) {
+        msg.swipes[msg.swipe_id] = text;
+    }
+
+    try {
+        if (typeof ctx.updateMessageBlock === 'function') {
+            ctx.updateMessageBlock(idx, msg);
+        } else if (ctx.reloadCurrentChat) {
+            await ctx.reloadCurrentChat();
+        }
+    } catch (e) {
+        console.warn(LOG, '刷新消息渲染失败：', e);
+    }
+    try {
+        await ctx.eventSource.emit(ctx.event_types.MESSAGE_UPDATED, idx);
+    } catch { /* 事件通知失败不影响主流程 */ }
+    try {
+        if (ctx.saveChat) await ctx.saveChat();
+    } catch (e) {
+        console.warn(LOG, 'saveChat 失败：', e);
+    }
+}
+
 async function applyCutToLastMessage({ silent = false } = {}) {
     const ctx = SillyTavern.getContext();
     const s = getSettings();
@@ -342,29 +369,7 @@ async function applyCutToLastMessage({ silent = false } = {}) {
     const cutResult = text.replace(/\s+$/, '');
     const appended = String(s.appendText ?? '');
     text = appendAfterCut(cutResult, appended);
-    msg.mes = text;
-    if (Array.isArray(msg.swipes) && Number.isInteger(msg.swipe_id) &&
-        msg.swipe_id >= 0 && msg.swipe_id < msg.swipes.length) {
-        msg.swipes[msg.swipe_id] = text;
-    }
-
-    try {
-        if (typeof ctx.updateMessageBlock === 'function') {
-            ctx.updateMessageBlock(idx, msg);
-        } else if (ctx.reloadCurrentChat) {
-            await ctx.reloadCurrentChat();
-        }
-    } catch (e) {
-        console.warn(LOG, '刷新消息渲染失败：', e);
-    }
-    try {
-        await ctx.eventSource.emit(ctx.event_types.MESSAGE_UPDATED, idx);
-    } catch { /* 事件通知失败不影响主流程 */ }
-    try {
-        if (ctx.saveChat) await ctx.saveChat();
-    } catch (e) {
-        console.warn(LOG, 'saveChat 失败：', e);
-    }
+    await updateAssistantMessageText(ctx, idx, text);
 
     const removed = Array.from(original).length - Array.from(cutResult).length;
     const appendedCount = Array.from(appended).length;
@@ -403,7 +408,8 @@ async function maybeAutoContinue(regexCutApplied) {
     const idx = findLastAssistantIndex(chat);
     if (idx < 0) { clearContinuePrompt(); return; }
 
-    const total = await countTokens(String(chat[idx].mes ?? ''));
+    const messageText = String(chat[idx].mes ?? '');
+    const total = await countTokens(messageText);
     const maxTotal = Math.max(1, Number(ac.maxTotalTokens) || 1);
     if (total >= maxTotal) {
         clearContinuePrompt();
@@ -419,6 +425,13 @@ async function maybeAutoContinue(regexCutApplied) {
         clearContinuePrompt();
         roundsThisMessage = 0;
         return;
+    }
+
+    // 部分 Claude 接口拒绝末尾带空白的 assistant 内容，续写前必须先清理。
+    const trimmedText = messageText.trimEnd();
+    if (trimmedText !== messageText) {
+        await updateAssistantMessageText(ctx, idx, trimmedText);
+        console.log(LOG, `续写前已清理消息 #${idx} 末尾空白`);
     }
     roundsThisMessage++;
 

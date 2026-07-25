@@ -27,6 +27,7 @@ SillyTavern 第三方 UI 扩展：按可配置的正则组实时检测 AI 回复
 - **最大总 token**：整条消息达到该值后停止续写；
 - 续写提示词通过 `setExtensionPrompt` 注入，**只进入本次请求的 prompt，
   不写入对话记录**，注入角色可选 system / user，默认使用 user，兼容不允许请求以 assistant 结尾的 Claude 接口；
+- 发起续写前会清理上一段 assistant 内容末尾的空白，兼容 Claude 对 assistant 尾部空白的校验；
 - 手动点「停止」不会触发续写；正则命中截断的消息也不再续写；
 - 内置轮次安全上限（⌈最大总量 ÷ 每段⌉ + 3），防止失控循环。
 
