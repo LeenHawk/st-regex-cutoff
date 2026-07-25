@@ -32,8 +32,10 @@ const DEFAULT_GROUP = Object.freeze({
 });
 
 const DEFAULT_SETTINGS = Object.freeze({
+    settingsVersion: 2,
     enabled: true,
     deleteChars: 0,     // 截断点再往前多删的字符数（按码点计）
+    appendText: '',     // 正则截断后追加到消息末尾的文本
     streamAbort: true,  // 流式命中时立即中止生成
     notify: true,       // 触发时弹出提示
     groups: [],
@@ -43,7 +45,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         enabled: false,
         segmentTokens: 1000,    // 每段生成到多少 token 后截断并续写
         maxTotalTokens: 4000,   // 整条消息最大总 token，达到后不再续写
-        role: 'system',         // 续写提示词的注入角色：system / user
+        role: 'user',           // 默认用 user，兼容不允许请求以 assistant 结尾的 Claude 接口
         prompt:
             'Continue the reply seamlessly from exactly where it was cut off. ' +
             'Do not repeat any existing text, do not summarize, and do not add any preamble.',
@@ -58,6 +60,7 @@ function getSettings() {
         store[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
     }
     const s = store[MODULE_NAME];
+    const previousVersion = Math.max(1, Number(s.settingsVersion) || 1);
     for (const k of Object.keys(DEFAULT_SETTINGS)) {
         if (!Object.hasOwn(s, k)) s[k] = structuredClone(DEFAULT_SETTINGS[k]);
     }
@@ -72,6 +75,12 @@ function getSettings() {
     }
     for (const k of Object.keys(DEFAULT_SETTINGS.autoContinue)) {
         if (!Object.hasOwn(s.autoContinue, k)) s.autoContinue[k] = DEFAULT_SETTINGS.autoContinue[k];
+    }
+    if (previousVersion < 2) {
+        // 旧版本默认是 system；升级时改为 user，确保续写请求不会以 assistant 结尾。
+        s.autoContinue.role = 'user';
+        s.settingsVersion = 2;
+        ctx.saveSettingsDebounced();
     }
     return s;
 }
@@ -158,6 +167,10 @@ function cutText(text, cutStart, deleteChars) {
     if (x === 0) return head;
     const cps = Array.from(head);
     return cps.slice(0, Math.max(0, cps.length - x)).join('');
+}
+
+function appendAfterCut(text, appendText) {
+    return text.replace(/\s+$/, '') + String(appendText ?? '');
 }
 
 // ============================================================
@@ -326,7 +339,9 @@ async function applyCutToLastMessage({ silent = false } = {}) {
         return false;
     }
 
-    text = text.replace(/\s+$/, '');
+    const cutResult = text.replace(/\s+$/, '');
+    const appended = String(s.appendText ?? '');
+    text = appendAfterCut(cutResult, appended);
     msg.mes = text;
     if (Array.isArray(msg.swipes) && Number.isInteger(msg.swipe_id) &&
         msg.swipe_id >= 0 && msg.swipe_id < msg.swipes.length) {
@@ -351,10 +366,12 @@ async function applyCutToLastMessage({ silent = false } = {}) {
         console.warn(LOG, 'saveChat 失败：', e);
     }
 
-    const removed = original.length - text.length;
-    console.log(LOG, `已截断消息 #${idx}，命中分组 [${[...hitGroups].join('、')}]，删除 ${removed} 个字符`);
+    const removed = Array.from(original).length - Array.from(cutResult).length;
+    const appendedCount = Array.from(appended).length;
+    const appendSummary = appendedCount > 0 ? `，追加 ${appendedCount} 个字符` : '';
+    console.log(LOG, `已截断消息 #${idx}，命中分组 [${[...hitGroups].join('、')}]，删除 ${removed} 个字符${appendSummary}`);
     if (s.notify) {
-        toastr.success(`命中分组 [${[...hitGroups].join('、')}]，已截断并删除 ${removed} 个字符`, '正则截断');
+        toastr.success(`命中分组 [${[...hitGroups].join('、')}]，已截断并删除 ${removed} 个字符${appendSummary}`, '正则截断');
     }
     return true;
 }
@@ -481,6 +498,11 @@ function buildSettingsHtml() {
           </div>
           <small class="notes">截断规则：删除“最早命中位置”及其之后的全部文本，再在此基础上往前多删 X 个字符。</small>
 
+          <label for="rc_append_text" style="margin-top:6px;">截断后追加文本/脚本内容（留空则不追加）</label>
+          <textarea id="rc_append_text" class="text_pole textarea_compact" rows="3"
+            placeholder="内容会按原样追加到截断后的 AI 消息末尾"></textarea>
+          <small class="notes">只在正则命中并实际截断时追加；追加内容不会再次参与正则检测。</small>
+
           <hr>
           <h4>正则组</h4>
           <small class="notes">组内每行一条正则，支持 <code>/pattern/flags</code> 写法（如 <code>/结局/i</code>），普通写法默认无 flags。组内逻辑可选“任一命中（并）”或“全部命中（交）”；组与组之间为并集，任何一组命中即触发。</small>
@@ -516,7 +538,7 @@ function buildSettingsHtml() {
               <option value="user">user</option>
             </select>
           </div>
-          <small class="notes">需要开启流式输出才能按段截断。续写走 ST 原生“继续”机制，每段开始时 token 计数自动清零；手动点停止不会触发续写；若正则命中截断，续写同样终止。</small>
+          <small class="notes">需要开启流式输出才能按段截断。续写走 ST 原生“继续”机制，每段开始时 token 计数自动清零；默认以 user 角色注入，兼容不允许请求以 assistant 结尾的 Claude 接口；手动点停止不会触发续写；若正则命中截断，续写同样终止。</small>
 
           <hr>
           <h4>测试与手动执行</h4>
@@ -579,6 +601,7 @@ function refreshUI() {
     $('#rc_stream_abort').prop('checked', s.streamAbort);
     $('#rc_notify').prop('checked', s.notify);
     $('#rc_delete_chars').val(s.deleteChars);
+    $('#rc_append_text').val(s.appendText);
     $('#rc_ac_enabled').prop('checked', s.autoContinue.enabled);
     $('#rc_ac_segment').val(s.autoContinue.segmentTokens);
     $('#rc_ac_max').val(s.autoContinue.maxTotalTokens);
@@ -597,6 +620,7 @@ function bindUI() {
         s.deleteChars = Math.max(0, parseInt($(this).val()) || 0);
         save();
     });
+    $('#rc_append_text').on('input', function () { s.appendText = String($(this).val()); save(); });
 
     $('#rc_ac_enabled').on('change', function () { s.autoContinue.enabled = $(this).prop('checked'); save(); });
     $('#rc_ac_segment').on('input', function () {
@@ -654,10 +678,14 @@ function bindUI() {
         if (!text) { $out.text('请先输入测试文本'); return; }
         const hit = detect(text, s);
         if (!hit) { $out.text('未命中任何分组'); return; }
-        const result = cutText(text, hit.cutStart, s.deleteChars);
+        const cutResult = cutText(text, hit.cutStart, s.deleteChars).replace(/\s+$/, '');
+        const result = appendAfterCut(cutResult, s.appendText);
+        const removed = Array.from(text).length - Array.from(cutResult).length;
+        const appended = Array.from(String(s.appendText ?? '')).length;
+        const appendSummary = appended > 0 ? `，追加 ${appended} 个字符` : '';
         $out.text(
             `命中分组：[${hit.groupNames.join('、')}]，命中位置：${hit.cutStart}\n` +
-            `截断后（删除 ${text.length - result.length} 个字符）：\n${result || '（空）'}`
+            `截断后（删除 ${removed} 个字符${appendSummary}）：\n${result || '（空）'}`
         );
     });
 
