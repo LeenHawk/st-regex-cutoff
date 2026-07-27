@@ -15,14 +15,18 @@
  *    3) 非流式或流式期间漏检时，在消息落库后兜底检测并截断。
  *
  *  分段自动续写（可选）：
- *    流式生成中按 token 计数，每段达到阈值即中止生成，然后注入“续写提示词”
- *    （只进入本次请求、不写入对话记录）并自动触发 ST 原生“继续”续写；
- *    每段开始时 token 计数自动清零；整条消息达到最大总 token 后停止续写。
+ *    流式生成中按两种条件分段，可各自开关、并行生效（先满足者先触发）：
+ *      - 按 token：本段生成 token 数达到阈值；
+ *      - 按时长：本段已生成秒数达到阈值。
+ *    达标即中止生成，然后注入“续写提示词”（只进入本次请求、不写入对话记录）
+ *    并自动触发 ST 原生“继续”续写；每段开始时 token 计数与计时自动清零；
+ *    整条消息达到最大总 token 后停止续写。
  *    若正则命中导致截断，续写循环同样终止。
  */
 
 const MODULE_NAME = 'regex_cutoff';
 const LOG = '[正则截断]';
+const SETTINGS_VERSION = 3;
 
 const DEFAULT_GROUP = Object.freeze({
     name: '新分组',
@@ -32,7 +36,7 @@ const DEFAULT_GROUP = Object.freeze({
 });
 
 const DEFAULT_SETTINGS = Object.freeze({
-    settingsVersion: 2,
+    settingsVersion: SETTINGS_VERSION,
     enabled: true,
     deleteChars: 0,     // 截断点再往前多删的字符数（按码点计）
     appendText: '',     // 正则截断后追加到消息末尾的文本
@@ -43,7 +47,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     // —— 分段自动续写 ——
     autoContinue: {
         enabled: false,
+        byTokens: true,         // 按 token 分段
         segmentTokens: 1000,    // 每段生成到多少 token 后截断并续写
+        bySeconds: false,       // 按时长分段（与 token 并行，先到先触发）
+        segmentSeconds: 30,     // 每段生成多少秒后截断并续写
         maxTotalTokens: 4000,   // 整条消息最大总 token，达到后不再续写
         role: 'user',           // 默认用 user，兼容不允许请求以 assistant 结尾的 Claude 接口
         prompt:
@@ -79,7 +86,14 @@ function getSettings() {
     if (previousVersion < 2) {
         // 旧版本默认是 system；升级时改为 user，确保续写请求不会以 assistant 结尾。
         s.autoContinue.role = 'user';
-        s.settingsVersion = 2;
+    }
+    if (previousVersion < 3) {
+        // 新增“按时长分段”；老配置保持原行为：只按 token 分段。
+        s.autoContinue.byTokens = true;
+        s.autoContinue.bySeconds = false;
+    }
+    if (previousVersion < SETTINGS_VERSION) {
+        s.settingsVersion = SETTINGS_VERSION;
         ctx.saveSettingsDebounced();
     }
     return s;
@@ -213,13 +227,17 @@ function clearContinuePrompt() {
 //  流式实时检测：正则命中即中止；分段 token 达标即中止并续写
 // ============================================================
 let abortedThisGen = false;         // 本次生成因“正则命中”而中止
-let tokenAbortedThisGen = false;    // 本次生成因“达到每段 token 上限”而中止
+let segmentAbortedThisGen = false;  // 本次生成因“达到分段上限（token/时长）”而中止
+let segmentAbortReason = '';        // 'tokens' | 'seconds'
 let pendingAutoContinue = false;    // 已请求自动续写，等待下一次生成开始
 let currentIsAutoContinue = false;  // 当前生成是否为本扩展触发的自动续写
 let currentGenType = '';
 let roundsThisMessage = 0;          // 本条消息已自动续写的段数
 let streamBaselineTokens = 0;       // 续写时流式文本包含已有前缀，作为计数基线
+let segmentStartedAt = 0;           // 本段开始时间戳（收到首个流式片段时确定）
 let tokenCheck = { busy: false, last: 0 };
+
+const SECONDS_ROUNDS_CAP = 200;     // 纯时长分段时的轮次安全上限
 
 function stopGenerationNow() {
     const ctx = SillyTavern.getContext();
@@ -234,8 +252,10 @@ async function onGenerationStarted(type, _params, dryRun) {
     if (dryRun) return;
     currentGenType = String(type ?? '');
     abortedThisGen = false;
-    tokenAbortedThisGen = false;
+    segmentAbortedThisGen = false;
+    segmentAbortReason = '';
     tokenCheck = { busy: false, last: 0 };
+    segmentStartedAt = 0;
     currentIsAutoContinue = pendingAutoContinue;
     pendingAutoContinue = false;
     if (!currentIsAutoContinue) {
@@ -259,7 +279,7 @@ async function onGenerationStarted(type, _params, dryRun) {
 async function onStreamToken(raw) {
     try {
         const s = getSettings();
-        if (!s.enabled || abortedThisGen || tokenAbortedThisGen) return;
+        if (!s.enabled || abortedThisGen || segmentAbortedThisGen) return;
         const text = String(raw ?? '');
 
         // —— 正则实时检测 ——
@@ -273,20 +293,40 @@ async function onStreamToken(raw) {
             }
         }
 
-        // —— 分段 token 检测（节流 250ms，需开启流式才生效） ——
+        // —— 分段检测（需开启流式才生效） ——
         const ac = s.autoContinue;
         if (!ac.enabled) return;
         if (currentGenType === 'quiet' || currentGenType === 'impersonate') return;
+
         const now = Date.now();
+        // 基线以“首个流式片段到达”为准，排除请求排队/首 token 延迟
+        if (!segmentStartedAt) segmentStartedAt = now;
+
+        // 按时长分段（无成本，优先判断）
+        if (ac.bySeconds) {
+            const limitMs = Math.max(1, Number(ac.segmentSeconds) || 0) * 1000;
+            const elapsed = now - segmentStartedAt;
+            if (elapsed >= limitMs) {
+                segmentAbortedThisGen = true;
+                segmentAbortReason = 'seconds';
+                console.log(LOG, `本段已生成 ${(elapsed / 1000).toFixed(1)} 秒，达到上限 ${ac.segmentSeconds} 秒，截断本段`);
+                stopGenerationNow();
+                return;
+            }
+        }
+
+        // 按 token 分段（计数有开销，节流 250ms）
+        if (!ac.byTokens) return;
         if (tokenCheck.busy || now - tokenCheck.last < 250) return;
         tokenCheck.busy = true;
         try {
             const total = await countTokens(text);
             tokenCheck.last = Date.now();
             const segment = total - streamBaselineTokens;
-            if (!tokenAbortedThisGen && !abortedThisGen &&
+            if (!segmentAbortedThisGen && !abortedThisGen &&
                 segment >= Math.max(1, Number(ac.segmentTokens) || 0)) {
-                tokenAbortedThisGen = true;
+                segmentAbortedThisGen = true;
+                segmentAbortReason = 'tokens';
                 console.log(LOG, `本段已生成 ${segment} token，达到上限 ${ac.segmentTokens}，截断本段`);
                 stopGenerationNow();
             }
@@ -431,12 +471,14 @@ async function maybeAutoContinue(regexCutApplied) {
     const s = getSettings();
     const ac = s.autoContinue;
 
-    // 只有“因每段 token 上限而中止”的生成才续写；其余情况清掉注入即可
-    if (!tokenAbortedThisGen) {
+    // 只有“因分段上限而中止”的生成才续写；其余情况清掉注入即可
+    if (!segmentAbortedThisGen) {
         if (!pendingAutoContinue) clearContinuePrompt();
         return;
     }
-    tokenAbortedThisGen = false;
+    const reason = segmentAbortReason;
+    segmentAbortedThisGen = false;
+    segmentAbortReason = '';
 
     if (!s.enabled || !ac.enabled) { clearContinuePrompt(); return; }
     // 正则命中截断过的消息不再续写
@@ -460,8 +502,10 @@ async function maybeAutoContinue(regexCutApplied) {
         return;
     }
 
-    // 防失控：轮次上限 = ceil(最大总量/每段) + 3
-    const cap = Math.ceil(maxTotal / Math.max(1, Number(ac.segmentTokens) || 1)) + 3;
+    // 防失控：按 token 分段时轮次上限 = ceil(最大总量/每段) + 3；纯时长分段时用固定上限
+    const cap = ac.byTokens
+        ? Math.ceil(maxTotal / Math.max(1, Number(ac.segmentTokens) || 1)) + 3
+        : SECONDS_ROUNDS_CAP;
     if (roundsThisMessage >= cap) {
         console.warn(LOG, `续写轮次达到安全上限 ${cap}，停止`);
         clearContinuePrompt();
@@ -479,7 +523,10 @@ async function maybeAutoContinue(regexCutApplied) {
 
     setContinuePrompt(ac.prompt);
     pendingAutoContinue = true;
-    if (s.notify) toastr.info(`当前 ${total}/${maxTotal} token，自动续写第 ${roundsThisMessage} 段`, '正则截断');
+    if (s.notify) {
+        const reasonText = reason === 'seconds' ? `已生成 ${ac.segmentSeconds} 秒` : `本段 token 达标`;
+        toastr.info(`${reasonText}，当前 ${total}/${maxTotal} token，自动续写第 ${roundsThisMessage} 段`, '正则截断');
+    }
     try {
         if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
             await ctx.executeSlashCommandsWithOptions('/continue');
@@ -572,15 +619,32 @@ function buildSettingsHtml() {
 
           <label class="checkbox_label" for="rc_ac_enabled">
             <input id="rc_ac_enabled" type="checkbox" />
-            <span>启用：每段生成到指定 token 数即截断，并自动续写下一段</span>
+            <span>启用：每段生成达到下列任一条件即截断，并自动续写下一段</span>
           </label>
 
           <div class="flex-container" style="align-items:center; gap:6px; margin-top:6px;">
-            <span>每段</span>
+            <label class="checkbox_label" for="rc_ac_by_tokens" style="margin:0;">
+              <input id="rc_ac_by_tokens" type="checkbox" />
+              <span>按 token：每段</span>
+            </label>
             <input id="rc_ac_segment" type="number" min="50" step="50" class="text_pole" style="max-width:90px;" />
-            <span>token 截断续写；总量达</span>
+            <span>token</span>
+          </div>
+
+          <div class="flex-container" style="align-items:center; gap:6px; margin-top:6px;">
+            <label class="checkbox_label" for="rc_ac_by_seconds" style="margin:0;">
+              <input id="rc_ac_by_seconds" type="checkbox" />
+              <span>按时长：每段</span>
+            </label>
+            <input id="rc_ac_seconds" type="number" min="1" step="1" class="text_pole" style="max-width:90px;" />
+            <span>秒</span>
+          </div>
+          <small class="notes">两个条件可同时开启，并行判定、先到先截断；至少勾选一项，否则不会分段。计时从本段收到第一个流式片段开始。</small>
+
+          <div class="flex-container" style="align-items:center; gap:6px; margin-top:6px;">
+            <span>总量达</span>
             <input id="rc_ac_max" type="number" min="100" step="100" class="text_pole" style="max-width:90px;" />
-            <span>token 后停止</span>
+            <span>token 后停止续写</span>
           </div>
 
           <label for="rc_ac_prompt" style="margin-top:6px;">续写提示词（只注入本次请求，不进对话记录）</label>
@@ -593,7 +657,7 @@ function buildSettingsHtml() {
               <option value="user">user</option>
             </select>
           </div>
-          <small class="notes">需要开启流式输出才能按段截断。续写走 ST 原生“继续”机制，每段开始时 token 计数自动清零；默认以 user 角色注入，兼容不允许请求以 assistant 结尾的 Claude 接口；手动点停止不会触发续写；若正则命中截断，续写同样终止。</small>
+          <small class="notes">需要开启流式输出才能按段截断。续写走 ST 原生“继续”机制，每段开始时 token 计数与计时自动清零；默认以 user 角色注入，兼容不允许请求以 assistant 结尾的 Claude 接口；手动点停止不会触发续写；若正则命中截断，续写同样终止。</small>
 
           <hr>
           <h4>测试与手动执行</h4>
@@ -658,7 +722,10 @@ function refreshUI() {
     $('#rc_delete_chars').val(s.deleteChars);
     $('#rc_append_text').val(s.appendText);
     $('#rc_ac_enabled').prop('checked', s.autoContinue.enabled);
+    $('#rc_ac_by_tokens').prop('checked', s.autoContinue.byTokens);
     $('#rc_ac_segment').val(s.autoContinue.segmentTokens);
+    $('#rc_ac_by_seconds').prop('checked', s.autoContinue.bySeconds);
+    $('#rc_ac_seconds').val(s.autoContinue.segmentSeconds);
     $('#rc_ac_max').val(s.autoContinue.maxTotalTokens);
     $('#rc_ac_prompt').val(s.autoContinue.prompt);
     $('#rc_ac_role').val(s.autoContinue.role);
@@ -678,8 +745,14 @@ function bindUI() {
     $('#rc_append_text').on('input', function () { s.appendText = String($(this).val()); save(); });
 
     $('#rc_ac_enabled').on('change', function () { s.autoContinue.enabled = $(this).prop('checked'); save(); });
+    $('#rc_ac_by_tokens').on('change', function () { s.autoContinue.byTokens = $(this).prop('checked'); save(); });
     $('#rc_ac_segment').on('input', function () {
         s.autoContinue.segmentTokens = Math.max(1, parseInt($(this).val()) || 1000);
+        save();
+    });
+    $('#rc_ac_by_seconds').on('change', function () { s.autoContinue.bySeconds = $(this).prop('checked'); save(); });
+    $('#rc_ac_seconds').on('input', function () {
+        s.autoContinue.segmentSeconds = Math.max(1, parseInt($(this).val()) || 30);
         save();
     });
     $('#rc_ac_max').on('input', function () {
@@ -792,7 +865,8 @@ jQuery(async () => {
         eventSource.on(event_types.CHAT_CHANGED, () => {
             // 切换聊天时终止续写循环并清掉注入
             pendingAutoContinue = false;
-            tokenAbortedThisGen = false;
+            segmentAbortedThisGen = false;
+            segmentAbortReason = '';
             roundsThisMessage = 0;
             clearContinuePrompt();
         });
